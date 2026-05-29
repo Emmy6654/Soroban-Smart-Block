@@ -3,6 +3,7 @@ import { SorobanRpc, xdr, StrKey } from "@stellar/stellar-sdk";
 import { startApi } from "./api.js";
 import { db } from "./db.js";
 import { decode } from "./decoder.js";
+import { startAbiSync } from "./githubAbiSync.js";
 
 const RPC_URL    = process.env.SOROBAN_RPC_URL    || "https://soroban-testnet.stellar.org";
 const START_LEDGER = Number(process.env.START_LEDGER || 0);
@@ -30,6 +31,7 @@ async function indexLedger(ledger) {
 async function run() {
   await db.init();
   startApi();
+  startAbiSync();
 
   let cursor = START_LEDGER || (await rpc.getLatestLedger()).sequence - 100;
 
