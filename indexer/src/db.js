@@ -41,11 +41,16 @@ export const db = {
     );
   },
 
-  async getEvents({ contract, fn, page = 1, limit = 25 } = {}) {
+  async getEvents({ contract, fn, page = 1, limit = 25, type } = {}) {
     const conditions = [];
     const params = [];
     if (contract) { params.push(contract); conditions.push(`contract_id = $${params.length}`); }
     if (fn)       { params.push(fn);       conditions.push(`function = $${params.length}`); }
+    // Issue #48: filter by transaction type
+    // "soroban"  → contract_id is non-empty (Soroban invocations/deployments)
+    // "classic"  → contract_id is empty string or NULL
+    if (type === "soroban") { conditions.push(`contract_id IS NOT NULL AND contract_id <> ''`); }
+    if (type === "classic") { conditions.push(`(contract_id IS NULL OR contract_id = '')`); }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
     const offset = (page - 1) * limit;
     params.push(limit, offset);

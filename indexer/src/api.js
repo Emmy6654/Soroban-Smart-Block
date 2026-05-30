@@ -16,6 +16,7 @@ export function startApi() {
         contract: req.query.contract,
         fn:       req.query.fn,
         page:     Number(req.query.page) || 1,
+        type:     req.query.type,
       });
       res.json(events);
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -121,6 +122,43 @@ export function startApi() {
       }
       res.json(spec);
     } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // POST /api/simulate — issue #46: simulate a contract call via RPC
+  app.post("/api/simulate", async (req, res) => {
+    try {
+      const { contractId, fn, args = [] } = req.body;
+      if (!contractId || !fn) return res.status(400).json({ error: "Missing contractId or fn" });
+
+      const { SorobanRpc, Contract, nativeToScVal, xdr } = await import("@stellar/stellar-sdk");
+      const rpcUrl = process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
+      const server = new SorobanRpc.Server(rpcUrl);
+
+      const contract = new Contract(contractId);
+      const scArgs = args.map(a => nativeToScVal(a));
+      const op = contract.call(fn, ...scArgs);
+
+      const account = await server.getAccount(process.env.SIMULATE_SOURCE || "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN");
+      const { TransactionBuilder, Networks, BASE_FEE } = await import("@stellar/stellar-sdk");
+      const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: Networks.TESTNET })
+        .addOperation(op)
+        .setTimeout(30)
+        .build();
+
+      const sim = await server.simulateTransaction(tx);
+
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        return res.json({ success: false, error: sim.error });
+      }
+
+      const cost = sim.cost ?? {};
+      const retVal = sim.result?.retval;
+      res.json({
+        success: true,
+        returnValue: retVal ? retVal.toXDR("base64") : undefined,
+        cost: { cpuInsns: String(cost.cpuInsns ?? 0), memBytes: String(cost.memBytes ?? 0) },
+      });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
   });
 
   // GET /api/wallet/:address
