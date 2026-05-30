@@ -6,6 +6,8 @@ import { decode } from "./decoder.js";
 import { startAbiSync } from "./githubAbiSync.js";
 import { withRetry } from "./rpcRetry.js";
 import { handleVaultEvent, refreshAllVaults } from "./vaultIndexer.js";
+import { handleAllowanceEvent, pruneExpiredAllowances, bootstrapAllowanceEngine } from "./allowanceEngine.js";
+import { refreshAllProtocols, bootstrapTVLIndexer } from "./tvlIndexer.js";
 
 const RPC_URL    = process.env.SOROBAN_RPC_URL    || "https://soroban-testnet.stellar.org";
 const START_LEDGER = Number(process.env.START_LEDGER || 0);
@@ -32,6 +34,7 @@ async function indexLedger(ledger) {
     await db.upsertEvent(decoded);
     publish(decoded);                          // Issue #39 — push to WS clients
     handleVaultEvent(decoded);                 // vault ratio update (async, non-blocking)
+    handleAllowanceEvent(decoded);             // allowance engine (async, non-blocking)
     console.log(`[${ev.ledger}] ${decoded.function}: ${decoded.description}`);
   }
 
@@ -52,6 +55,21 @@ async function run() {
   refreshAllVaults().catch(() => {});
   // Periodic ratio refresh every 60s for vaults that accrue without emitting events
   setInterval(() => refreshAllVaults().catch(() => {}), 60_000);
+
+  // Bootstrap allowance engine: prune expired allowances from downtime
+  bootstrapAllowanceEngine().catch(() => {});
+  // Periodic allowance expiry pruning every 120s
+  setInterval(async () => {
+    try {
+      const latest = await withRetry(() => rpc.getLatestLedger());
+      await pruneExpiredAllowances(latest.sequence);
+    } catch {}
+  }, 120_000);
+
+  // Bootstrap TVL indexer: initial reserves and TVL snapshots
+  bootstrapTVLIndexer().catch(() => {});
+  // Periodic TVL refresh every 120s
+  setInterval(() => refreshAllProtocols().catch(() => {}), 120_000);
 
   let cursor = START_LEDGER || (await withRetry(() => rpc.getLatestLedger())).sequence - 100;
 

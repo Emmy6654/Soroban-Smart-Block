@@ -4,6 +4,8 @@ import { db } from "./db.js";
 import { fetchTokenMetadata } from "./sep41Metadata.js";
 import { attachWebSocketServer } from "./wsEvents.js";
 import { bootstrapVault, refreshVaultRatio } from "./vaultIndexer.js";
+import { pruneExpiredAllowances } from "./allowanceEngine.js";
+import { refreshPool } from "./tvlIndexer.js";
 
 const PORT = process.env.PORT || 3001;
 const VERIFY_ON_UPLOAD = process.env.VERIFY_ABI !== "false";
@@ -275,6 +277,123 @@ export function startApi() {
     try {
       await db.unregisterVault(req.params.id);
       res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ── Allowance engine endpoints ───────────────────────────────────────────────
+
+  // GET /api/allowances/:address — active allowances granted by this address
+  app.get("/api/allowances/:address", async (req, res) => {
+    try {
+      const allowances = await db.getActiveAllowances(req.params.address);
+      res.json(allowances);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/allowances/:address/liabilities — aggregated liabilities per token
+  app.get("/api/allowances/:address/liabilities", async (req, res) => {
+    try {
+      const liabilities = await db.getAllowanceLiabilities(req.params.address);
+      res.json(liabilities);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/allowances/:address/history?token=&limit=&offset= — historical allowance changes for plotting
+  app.get("/api/allowances/:address/history", async (req, res) => {
+    try {
+      const { token, limit, offset } = req.query;
+      const history = await db.getAllowanceHistory(req.params.address, {
+        token: token || undefined,
+        limit: limit ? Math.min(Number(limit), 500) : 100,
+        offset: offset ? Number(offset) : 0,
+      });
+      res.json(history);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // POST /api/allowances/prune — manually trigger expired allowance cleanup
+  app.post("/api/allowances/prune", async (req, res) => {
+    try {
+      const { SorobanRpc } = await import("@stellar/stellar-sdk");
+      const server = new SorobanRpc.Server(RPC_URL, { allowHttp: true });
+      const ledger = (await server.getLatestLedger()).sequence;
+      const pruned = await pruneExpiredAllowances(ledger);
+      res.json({ ok: true, pruned, ledger });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ── TVL indexer endpoints ──────────────────────────────────────────────────
+
+  // POST /api/pools — register a liquidity pool
+  app.post("/api/pools", async (req, res) => {
+    try {
+      const { id, name, protocol, pool_type, token_a, token_b } = req.body;
+      if (!id) return res.status(400).json({ error: "Missing id" });
+
+      await db.registerPool({ id, name, protocol, pool_type, token_a, token_b });
+
+      const { SorobanRpc } = await import("@stellar/stellar-sdk");
+      const server = new SorobanRpc.Server(RPC_URL, { allowHttp: true });
+      const ledger = (await server.getLatestLedger()).sequence;
+      refreshPool(id, ledger).catch(err =>
+        console.error(`[tvl] Pool refresh error for ${id}: ${err.message}`)
+      );
+
+      res.status(201).json({ ok: true, id });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/pools — list all registered liquidity pools
+  app.get("/api/pools", async (req, res) => {
+    try {
+      const pools = await db.getPools();
+      res.json(pools);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/pools/:id — pool detail with latest reserves
+  app.get("/api/pools/:id", async (req, res) => {
+    try {
+      const pool = await db.getPool(req.params.id);
+      if (!pool) return res.status(404).json({ error: "Pool not found" });
+      const reserves = await db.getPoolReserves(req.params.id);
+      res.json({ ...pool, reserves });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // DELETE /api/pools/:id — unregister a pool
+  app.delete("/api/pools/:id", async (req, res) => {
+    try {
+      await db.unregisterPool(req.params.id);
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/tvl — latest TVL for all protocols
+  app.get("/api/tvl", async (req, res) => {
+    try {
+      const tvl = await db.getLatestTVL();
+      res.json(tvl);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/tvl/:protocol — TVL detail and latest snapshot for a protocol
+  app.get("/api/tvl/:protocol", async (req, res) => {
+    try {
+      const tvl = await db.getTVLByProtocol(req.params.protocol);
+      if (!tvl) return res.status(404).json({ error: "No TVL data for this protocol" });
+      res.json(tvl);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/tvl/:protocol/history — historical TVL snapshots
+  app.get("/api/tvl/:protocol/history", async (req, res) => {
+    try {
+      const { limit } = req.query;
+      const history = await db.getTVLHistory(req.params.protocol, {
+        limit: limit ? Math.min(Number(limit), 1000) : 100,
+      });
+      res.json(history);
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 

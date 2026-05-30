@@ -63,6 +63,79 @@ export const db = {
       );
       CREATE INDEX IF NOT EXISTS idx_vault_snapshots_contract ON vault_snapshots(contract_id);
       CREATE INDEX IF NOT EXISTS idx_vault_snapshots_ledger   ON vault_snapshots(ledger);
+
+      -- Allowance engine: tracks active third-party token allowance liabilities
+      CREATE TABLE IF NOT EXISTS token_allowances (
+        id                BIGSERIAL PRIMARY KEY,
+        owner             TEXT NOT NULL,
+        spender           TEXT NOT NULL,
+        token             TEXT NOT NULL,
+        amount            TEXT NOT NULL,
+        expiration_ledger BIGINT,
+        ledger            BIGINT NOT NULL,
+        tx_hash           TEXT,
+        created_at        TIMESTAMPTZ DEFAULT NOW(),
+        updated_at        TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(owner, spender, token)
+      );
+      CREATE INDEX IF NOT EXISTS idx_allowances_owner   ON token_allowances(owner);
+      CREATE INDEX IF NOT EXISTS idx_allowances_spender ON token_allowances(spender);
+      CREATE INDEX IF NOT EXISTS idx_allowances_token   ON token_allowances(token);
+
+      -- Allowance history: time-series of changes for plotting
+      CREATE TABLE IF NOT EXISTS allowance_history (
+        id                BIGSERIAL PRIMARY KEY,
+        owner             TEXT NOT NULL,
+        spender           TEXT NOT NULL,
+        token             TEXT NOT NULL,
+        amount            TEXT NOT NULL,
+        expiration_ledger BIGINT,
+        ledger            BIGINT NOT NULL,
+        tx_hash           TEXT,
+        recorded_at       TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_allowance_history_owner  ON allowance_history(owner);
+      CREATE INDEX IF NOT EXISTS idx_allowance_history_token  ON allowance_history(token);
+      CREATE INDEX IF NOT EXISTS idx_allowance_history_ledger ON allowance_history(ledger);
+
+      -- TVL indexer: token liquidity pool registry
+      CREATE TABLE IF NOT EXISTS liquidity_pools (
+        id            TEXT PRIMARY KEY,
+        name          TEXT,
+        protocol      TEXT NOT NULL DEFAULT 'unknown',
+        pool_type     TEXT,
+        token_a       TEXT,
+        token_b       TEXT,
+        active        BOOLEAN DEFAULT TRUE,
+        created_at    TIMESTAMPTZ DEFAULT NOW(),
+        updated_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_pools_protocol ON liquidity_pools(protocol);
+
+      -- Pool token reserves (current balance snapshots)
+      CREATE TABLE IF NOT EXISTS pool_reserves (
+        id          BIGSERIAL PRIMARY KEY,
+        pool_id     TEXT NOT NULL REFERENCES liquidity_pools(id) ON DELETE CASCADE,
+        token       TEXT NOT NULL,
+        reserve     TEXT NOT NULL,
+        ledger      BIGINT NOT NULL,
+        recorded_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(pool_id, token)
+      );
+      CREATE INDEX IF NOT EXISTS idx_pool_reserves_pool ON pool_reserves(pool_id);
+
+      -- Aggregated TVL snapshots per protocol
+      CREATE TABLE IF NOT EXISTS tvl_snapshots (
+        id              BIGSERIAL PRIMARY KEY,
+        protocol        TEXT NOT NULL,
+        tvl_raw         TEXT NOT NULL,
+        token_breakdown JSONB,
+        pool_count      INT DEFAULT 0,
+        ledger          BIGINT NOT NULL,
+        timestamp       TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_tvl_snapshots_protocol ON tvl_snapshots(protocol);
+      CREATE INDEX IF NOT EXISTS idx_tvl_snapshots_ledger   ON tvl_snapshots(ledger);
     `);
   },
 
@@ -260,6 +333,212 @@ export const db = {
        WHERE contract_id = $1
        ORDER BY ledger DESC LIMIT $2`,
       [contractId, limit]
+    );
+    return rows;
+  },
+
+  // ── Allowance engine methods ────────────────────────────────────────────────────
+
+  async upsertAllowance(allowance) {
+    await pool.query(
+      `INSERT INTO token_allowances (owner, spender, token, amount, expiration_ledger, ledger, tx_hash)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (owner, spender, token) DO UPDATE
+         SET amount=$4, expiration_ledger=$5, ledger=$6, tx_hash=$7, updated_at=NOW()`,
+      [
+        allowance.owner,
+        allowance.spender,
+        allowance.token,
+        allowance.amount,
+        allowance.expiration_ledger ?? null,
+        allowance.ledger,
+        allowance.tx_hash ?? null,
+      ]
+    );
+  },
+
+  async recordAllowanceHistory(allowance) {
+    await pool.query(
+      `INSERT INTO allowance_history (owner, spender, token, amount, expiration_ledger, ledger, tx_hash)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        allowance.owner,
+        allowance.spender,
+        allowance.token,
+        allowance.amount,
+        allowance.expiration_ledger ?? null,
+        allowance.ledger,
+        allowance.tx_hash ?? null,
+      ]
+    );
+  },
+
+  async removeAllowance(owner, spender, token) {
+    await pool.query(
+      `DELETE FROM token_allowances WHERE owner = $1 AND spender = $2 AND token = $3`,
+      [owner, spender, token]
+    );
+  },
+
+  async getActiveAllowances(owner) {
+    const { rows } = await pool.query(
+      `SELECT * FROM token_allowances
+       WHERE owner = $1
+         AND (expiration_ledger IS NULL OR expiration_ledger > (SELECT COALESCE(MAX(ledger), 0) FROM events))
+       ORDER BY token, spender`,
+      [owner]
+    );
+    return rows;
+  },
+
+  async getAllowanceLiabilities(owner) {
+    const { rows } = await pool.query(
+      `SELECT token,
+              COUNT(*) AS spender_count,
+              SUM(amount::NUMERIC)::TEXT AS total_liability_raw,
+              array_agg(spender) AS spenders
+       FROM token_allowances
+       WHERE owner = $1
+         AND (expiration_ledger IS NULL OR expiration_ledger > (SELECT COALESCE(MAX(ledger), 0) FROM events))
+       GROUP BY token
+       ORDER BY token`,
+      [owner]
+    );
+    return rows;
+  },
+
+  async getAllowanceHistory(owner, { token, limit = 100, offset = 0 } = {}) {
+    const params = [owner];
+    const conditions = ["owner = $1"];
+    if (token) {
+      params.push(token);
+      conditions.push(`token = $${params.length}`);
+    }
+    const where = conditions.join(" AND ");
+    params.push(limit, offset);
+    const { rows } = await pool.query(
+      `SELECT * FROM allowance_history
+       WHERE ${where}
+       ORDER BY ledger DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+    return rows;
+  },
+
+  async expireOldAllowances(currentLedger) {
+    const { rowCount } = await pool.query(
+      `DELETE FROM token_allowances
+       WHERE expiration_ledger IS NOT NULL AND expiration_ledger <= $1`,
+      [currentLedger]
+    );
+    return rowCount ?? 0;
+  },
+
+  // ── TVL indexer methods ─────────────────────────────────────────────────────────
+
+  async registerPool(pool) {
+    await pool.query(
+      `INSERT INTO liquidity_pools (id, name, protocol, pool_type, token_a, token_b)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (id) DO UPDATE
+         SET name=$2, protocol=$3, pool_type=$4, token_a=$5, token_b=$6, updated_at=NOW()`,
+      [pool.id, pool.name ?? null, pool.protocol ?? 'unknown', pool.pool_type ?? null, pool.token_a ?? null, pool.token_b ?? null]
+    );
+  },
+
+  async unregisterPool(poolId) {
+    await pool.query("DELETE FROM liquidity_pools WHERE id = $1", [poolId]);
+  },
+
+  async getPools() {
+    const { rows } = await pool.query(
+      `SELECT lp.*,
+        (SELECT ledger FROM pool_reserves WHERE pool_id = lp.id ORDER BY recorded_at DESC LIMIT 1) AS latest_ledger
+       FROM liquidity_pools lp WHERE lp.active = TRUE ORDER BY lp.created_at DESC`
+    );
+    return rows;
+  },
+
+  async getPool(poolId) {
+    const { rows } = await pool.query(
+      `SELECT * FROM liquidity_pools WHERE id = $1`,
+      [poolId]
+    );
+    return rows[0] ?? null;
+  },
+
+  async getActivePoolIds() {
+    const { rows } = await pool.query("SELECT id FROM liquidity_pools WHERE active = TRUE");
+    return rows.map(r => r.id);
+  },
+
+  async getPoolsByProtocol(protocol) {
+    const { rows } = await pool.query(
+      `SELECT * FROM liquidity_pools WHERE protocol = $1 AND active = TRUE`,
+      [protocol]
+    );
+    return rows;
+  },
+
+  async getDistinctProtocols() {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT protocol FROM liquidity_pools WHERE active = TRUE`
+    );
+    return rows.map(r => r.protocol);
+  },
+
+  async upsertPoolReserve(reserve) {
+    await pool.query(
+      `INSERT INTO pool_reserves (pool_id, token, reserve, ledger)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (pool_id, token) DO UPDATE
+         SET reserve=$3, ledger=$4, recorded_at=NOW()`,
+      [reserve.pool_id, reserve.token, reserve.reserve, reserve.ledger]
+    );
+  },
+
+  async getPoolReserves(poolId) {
+    const { rows } = await pool.query(
+      `SELECT * FROM pool_reserves WHERE pool_id = $1 ORDER BY token`,
+      [poolId]
+    );
+    return rows;
+  },
+
+  async upsertTVLSnapshot(snapshot) {
+    await pool.query(
+      `INSERT INTO tvl_snapshots (protocol, tvl_raw, token_breakdown, pool_count, ledger)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [snapshot.protocol, snapshot.tvl_raw, snapshot.token_breakdown ?? null, snapshot.pool_count ?? 0, snapshot.ledger]
+    );
+  },
+
+  async getLatestTVL() {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT ON (protocol) protocol, tvl_raw, token_breakdown, pool_count, ledger, timestamp
+       FROM tvl_snapshots
+       ORDER BY protocol, ledger DESC`
+    );
+    return rows;
+  },
+
+  async getTVLByProtocol(protocol) {
+    const { rows } = await pool.query(
+      `SELECT * FROM tvl_snapshots
+       WHERE protocol = $1
+       ORDER BY ledger DESC LIMIT 1`,
+      [protocol]
+    );
+    return rows[0] ?? null;
+  },
+
+  async getTVLHistory(protocol, { limit = 100 } = {}) {
+    const { rows } = await pool.query(
+      `SELECT * FROM tvl_snapshots
+       WHERE protocol = $1
+       ORDER BY ledger DESC LIMIT $2`,
+      [protocol, limit]
     );
     return rows;
   },

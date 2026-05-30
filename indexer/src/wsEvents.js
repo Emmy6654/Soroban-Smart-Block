@@ -30,6 +30,16 @@ export function publishVaultRatio(snapshot) {
   });
 }
 
+/** Publish a TVL update to all connected WebSocket clients. */
+export function publishTVL(tvl) {
+  bus.emit("tvl", {
+    protocol:       tvl.protocol,
+    tvl_raw:        tvl.tvl_raw,
+    token_breakdown: tvl.token_breakdown,
+    pool_count:     tvl.pool_count,
+  });
+}
+
 /**
  * Attach a WebSocket server to an existing HTTP server instance.
  *
@@ -55,12 +65,21 @@ export function attachWebSocketServer(httpServer) {
       }
     };
 
+    // Forward TVL updates
+    const tvlHandler = (tvl) => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ type: "tvl", data: tvl }));
+      }
+    };
+
     bus.on("event", handler);
     bus.on("vault_ratio", vaultHandler);
+    bus.on("tvl", tvlHandler);
 
     ws.on("close", () => {
       bus.off("event", handler);
       bus.off("vault_ratio", vaultHandler);
+      bus.off("tvl", tvlHandler);
       console.log("[ws] Client disconnected");
     });
 
@@ -68,6 +87,7 @@ export function attachWebSocketServer(httpServer) {
       console.error("[ws] Socket error:", err.message);
       bus.off("event", handler);
       bus.off("vault_ratio", vaultHandler);
+      bus.off("tvl", tvlHandler);
     });
 
     // Acknowledge connection
