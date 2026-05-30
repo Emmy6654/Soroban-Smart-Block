@@ -1,5 +1,6 @@
 import express from "express";
 import { db } from "./db.js";
+import { fetchTokenMetadata } from "./sep41Metadata.js";
 
 const PORT = process.env.PORT || 3001;
 
@@ -50,6 +51,22 @@ export function startApi() {
     try {
       const events = await db.getWalletEvents(req.params.address);
       res.json(events);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/tokens/:id/volume  — 24-hour rolling transfer volume
+  app.get("/api/tokens/:id/volume", async (req, res) => {
+    try {
+      const contractId = req.params.id;
+      // Fetch decimals from on-chain metadata (cached via contract registry or live sim)
+      let decimals = 7;
+      try {
+        const meta = await fetchTokenMetadata(contractId);
+        decimals = meta.decimals;
+      } catch { /* use default */ }
+
+      const volume = await db.get24hVolume(contractId, decimals);
+      res.json({ contract_id: contractId, window: "24h", ...volume });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 

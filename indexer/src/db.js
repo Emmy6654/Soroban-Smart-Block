@@ -75,6 +75,33 @@ export const db = {
     return rows[0] ?? null;
   },
 
+  /**
+   * Aggregate transfer volume for a contract over the last 24 hours.
+   * Amounts are stored as raw strings in raw_data; we cast via NUMERIC to
+   * avoid floating-point errors and return a BigInt-safe string.
+   * @param {string} contractId
+   * @param {number} decimals  token decimal places (default 7)
+   * @returns {Promise<{ volume_raw: string, volume_scaled: string, decimals: number }>}
+   */
+  async get24hVolume(contractId, decimals = 7) {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(SUM((raw_data::jsonb->>'amount')::NUMERIC), 0)::TEXT AS volume_raw
+       FROM events
+       WHERE contract_id = $1
+         AND function    = 'transfer'
+         AND created_at >= NOW() - INTERVAL '24 hours'`,
+      [contractId]
+    );
+    const raw = rows[0].volume_raw ?? "0";
+    // Scale using integer arithmetic via BigInt to avoid float rounding
+    const rawBig   = BigInt(raw.split(".")[0]); // NUMERIC may have no decimals
+    const divisor  = 10n ** BigInt(decimals);
+    const whole    = rawBig / divisor;
+    const fraction = rawBig % divisor;
+    const volume_scaled = `${whole}.${fraction.toString().padStart(decimals, "0")}`;
+    return { volume_raw: raw, volume_scaled, decimals };
+  },
+
   async upsertContractMeta(meta) {
     await pool.query(
       `INSERT INTO contracts (id, name, description, functions, registered_by)
