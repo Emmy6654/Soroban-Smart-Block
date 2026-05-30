@@ -136,6 +136,34 @@ export const db = {
       );
       CREATE INDEX IF NOT EXISTS idx_tvl_snapshots_protocol ON tvl_snapshots(protocol);
       CREATE INDEX IF NOT EXISTS idx_tvl_snapshots_ledger   ON tvl_snapshots(ledger);
+
+      -- Burn tracker: bridge-burn events (Soroban → Classic asset withdrawals)
+      CREATE TABLE IF NOT EXISTS bridge_burns (
+        id            BIGSERIAL PRIMARY KEY,
+        contract_id   TEXT NOT NULL,
+        asset_code    TEXT,
+        from_address  TEXT,
+        amount        TEXT NOT NULL,
+        ledger        BIGINT NOT NULL,
+        tx_hash       TEXT,
+        is_sac_bridge BOOLEAN DEFAULT FALSE,
+        recorded_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_bridge_burns_contract ON bridge_burns(contract_id);
+      CREATE INDEX IF NOT EXISTS idx_bridge_burns_ledger   ON bridge_burns(ledger);
+      CREATE INDEX IF NOT EXISTS idx_bridge_burns_asset    ON bridge_burns(asset_code);
+
+      -- Burn metrics: aggregated burn statistics per asset
+      CREATE TABLE IF NOT EXISTS burn_metrics (
+        id            BIGSERIAL PRIMARY KEY,
+        asset_code    TEXT,
+        contract_id   TEXT NOT NULL,
+        total_burned  TEXT NOT NULL,
+        burn_count    INT DEFAULT 0,
+        ledger        BIGINT NOT NULL,
+        recorded_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_burn_metrics_asset ON burn_metrics(asset_code);
     `);
   },
 
@@ -539,6 +567,73 @@ export const db = {
        WHERE protocol = $1
        ORDER BY ledger DESC LIMIT $2`,
       [protocol, limit]
+    );
+    return rows;
+  },
+
+  // ── Burn tracker methods ────────────────────────────────────────────────────────
+
+  async recordBridgeBurn(burn) {
+    await pool.query(
+      `INSERT INTO bridge_burns (contract_id, asset_code, from_address, amount, ledger, tx_hash, is_sac_bridge)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [burn.contract_id, burn.asset_code ?? null, burn.from_address ?? null, burn.amount, burn.ledger, burn.tx_hash ?? null, burn.is_sac_bridge ?? false]
+    );
+  },
+
+  async getBridgeBurns({ asset, limit = 100, offset = 0 } = {}) {
+    const params = [];
+    const conditions = [];
+    if (asset) {
+      params.push(asset);
+      conditions.push(`asset_code = $${params.length}`);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    params.push(limit, offset);
+    const { rows } = await pool.query(
+      `SELECT * FROM bridge_burns ${where} ORDER BY ledger DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+    return rows;
+  },
+
+  async getBurnMetrics() {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT ON (contract_id) contract_id, asset_code, total_burned, burn_count, ledger, recorded_at
+       FROM burn_metrics
+       ORDER BY contract_id, ledger DESC`
+    );
+    return rows;
+  },
+
+  async getBurnMetricsByAsset(assetCode) {
+    const { rows } = await pool.query(
+      `SELECT * FROM burn_metrics
+       WHERE asset_code = $1
+       ORDER BY ledger DESC LIMIT 1`,
+      [assetCode]
+    );
+    return rows[0] ?? null;
+  },
+
+  async upsertBurnMetric(metric) {
+    await pool.query(
+      `INSERT INTO burn_metrics (asset_code, contract_id, total_burned, burn_count, ledger)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [metric.asset_code, metric.contract_id, metric.total_burned, metric.burn_count, metric.ledger]
+    );
+  },
+
+  async getBurnAggregation() {
+    const { rows } = await pool.query(
+      `SELECT
+         contract_id,
+         COALESCE(MAX(asset_code), 'unknown') AS asset_code,
+         COUNT(*)::INT AS burn_count,
+         SUM(amount::NUMERIC)::TEXT AS total_burned
+       FROM bridge_burns
+       GROUP BY contract_id
+       ORDER BY total_burned DESC`
     );
     return rows;
   },

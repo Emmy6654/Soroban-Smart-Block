@@ -33,10 +33,22 @@ export function publishVaultRatio(snapshot) {
 /** Publish a TVL update to all connected WebSocket clients. */
 export function publishTVL(tvl) {
   bus.emit("tvl", {
-    protocol:       tvl.protocol,
-    tvl_raw:        tvl.tvl_raw,
+    protocol:        tvl.protocol,
+    tvl_raw:         tvl.tvl_raw,
     token_breakdown: tvl.token_breakdown,
-    pool_count:     tvl.pool_count,
+    pool_count:      tvl.pool_count,
+  });
+}
+
+/** Publish a bridge-burn event to all connected WebSocket clients. */
+export function publishBurn(burn) {
+  bus.emit("burn", {
+    contract_id:  burn.contract_id,
+    asset_code:   burn.asset_code,
+    amount:       burn.amount,
+    from_address: burn.from_address,
+    ledger:       burn.ledger,
+    is_sac_bridge: burn.is_sac_bridge,
   });
 }
 
@@ -72,14 +84,23 @@ export function attachWebSocketServer(httpServer) {
       }
     };
 
+    // Forward burn events
+    const burnHandler = (burn) => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ type: "burn", data: burn }));
+      }
+    };
+
     bus.on("event", handler);
     bus.on("vault_ratio", vaultHandler);
     bus.on("tvl", tvlHandler);
+    bus.on("burn", burnHandler);
 
     ws.on("close", () => {
       bus.off("event", handler);
       bus.off("vault_ratio", vaultHandler);
       bus.off("tvl", tvlHandler);
+      bus.off("burn", burnHandler);
       console.log("[ws] Client disconnected");
     });
 
@@ -88,6 +109,7 @@ export function attachWebSocketServer(httpServer) {
       bus.off("event", handler);
       bus.off("vault_ratio", vaultHandler);
       bus.off("tvl", tvlHandler);
+      bus.off("burn", burnHandler);
     });
 
     // Acknowledge connection

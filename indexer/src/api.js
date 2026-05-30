@@ -6,6 +6,7 @@ import { attachWebSocketServer } from "./wsEvents.js";
 import { bootstrapVault, refreshVaultRatio } from "./vaultIndexer.js";
 import { pruneExpiredAllowances } from "./allowanceEngine.js";
 import { refreshPool } from "./tvlIndexer.js";
+import { computeBurnMetrics } from "./burnTracker.js";
 
 const PORT = process.env.PORT || 3001;
 const VERIFY_ON_UPLOAD = process.env.VERIFY_ABI !== "false";
@@ -394,6 +395,49 @@ export function startApi() {
         limit: limit ? Math.min(Number(limit), 1000) : 100,
       });
       res.json(history);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ── Burn tracker endpoints ──────────────────────────────────────────────────
+
+  // GET /api/burns — list bridge-burn events
+  app.get("/api/burns", async (req, res) => {
+    try {
+      const { asset, limit, offset } = req.query;
+      const burns = await db.getBridgeBurns({
+        asset: asset || undefined,
+        limit: limit ? Math.min(Number(limit), 500) : 100,
+        offset: offset ? Number(offset) : 0,
+      });
+      res.json(burns);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/burns/metrics — aggregated burn metrics per asset
+  app.get("/api/burns/metrics", async (req, res) => {
+    try {
+      const metrics = await db.getBurnMetrics();
+      res.json(metrics);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/burns/metrics/:asset — burn metrics for a specific asset
+  app.get("/api/burns/metrics/:asset", async (req, res) => {
+    try {
+      const metric = await db.getBurnMetricsByAsset(req.params.asset);
+      if (!metric) return res.status(404).json({ error: "No metrics for this asset" });
+      res.json(metric);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // POST /api/burns/refresh — manually recompute burn metrics
+  app.post("/api/burns/refresh", async (req, res) => {
+    try {
+      const { SorobanRpc } = await import("@stellar/stellar-sdk");
+      const server = new SorobanRpc.Server(RPC_URL, { allowHttp: true });
+      const ledger = (await server.getLatestLedger()).sequence;
+      await computeBurnMetrics(ledger);
+      res.json({ ok: true, ledger });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 

@@ -8,6 +8,7 @@ import { withRetry } from "./rpcRetry.js";
 import { handleVaultEvent, refreshAllVaults } from "./vaultIndexer.js";
 import { handleAllowanceEvent, pruneExpiredAllowances, bootstrapAllowanceEngine } from "./allowanceEngine.js";
 import { refreshAllProtocols, bootstrapTVLIndexer } from "./tvlIndexer.js";
+import { handleBurnEvent, computeBurnMetrics, bootstrapBurnTracker } from "./burnTracker.js";
 
 const RPC_URL    = process.env.SOROBAN_RPC_URL    || "https://soroban-testnet.stellar.org";
 const START_LEDGER = Number(process.env.START_LEDGER || 0);
@@ -35,6 +36,7 @@ async function indexLedger(ledger) {
     publish(decoded);                          // Issue #39 — push to WS clients
     handleVaultEvent(decoded);                 // vault ratio update (async, non-blocking)
     handleAllowanceEvent(decoded);             // allowance engine (async, non-blocking)
+    handleBurnEvent(decoded);                  // burn tracker (async, non-blocking)
     console.log(`[${ev.ledger}] ${decoded.function}: ${decoded.description}`);
   }
 
@@ -70,6 +72,16 @@ async function run() {
   bootstrapTVLIndexer().catch(() => {});
   // Periodic TVL refresh every 120s
   setInterval(() => refreshAllProtocols().catch(() => {}), 120_000);
+
+  // Bootstrap burn tracker: initial burn metrics
+  bootstrapBurnTracker().catch(() => {});
+  // Periodic burn metric recomputation every 180s
+  setInterval(async () => {
+    try {
+      const latest = await withRetry(() => rpc.getLatestLedger());
+      await computeBurnMetrics(latest.sequence);
+    } catch {}
+  }, 180_000);
 
   let cursor = START_LEDGER || (await withRetry(() => rpc.getLatestLedger())).sequence - 100;
 
