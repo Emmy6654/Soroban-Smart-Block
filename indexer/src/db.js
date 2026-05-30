@@ -39,6 +39,30 @@ export const db = {
         hash       TEXT   NOT NULL,
         indexed_at TIMESTAMPTZ DEFAULT NOW()
       );
+
+      -- Vault indexer: yield vault / tokenized treasury registry
+      CREATE TABLE IF NOT EXISTS vaults (
+        contract_id      TEXT PRIMARY KEY,
+        name             TEXT,
+        underlying_asset TEXT,
+        decimals         INT DEFAULT 7,
+        active           BOOLEAN DEFAULT TRUE,
+        created_at       TIMESTAMPTZ DEFAULT NOW(),
+        updated_at       TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      -- Vault snapshots: periodic state captures for ratio computation
+      CREATE TABLE IF NOT EXISTS vault_snapshots (
+        id            BIGSERIAL PRIMARY KEY,
+        contract_id   TEXT NOT NULL REFERENCES vaults(contract_id) ON DELETE CASCADE,
+        ledger        BIGINT NOT NULL,
+        total_assets  TEXT NOT NULL,
+        total_supply  TEXT NOT NULL,
+        ratio         NUMERIC(40,20),
+        timestamp     TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_vault_snapshots_contract ON vault_snapshots(contract_id);
+      CREATE INDEX IF NOT EXISTS idx_vault_snapshots_ledger   ON vault_snapshots(ledger);
     `);
   },
 
@@ -172,5 +196,71 @@ export const db = {
        ON CONFLICT (id) DO UPDATE SET name=$2, description=$3, functions=$4`,
       [meta.id, meta.name, meta.description, JSON.stringify(meta.functions), meta.registered_by]
     );
+  },
+
+  // ── Vault indexer methods ──────────────────────────────────────────────────────
+
+  async registerVault(vault) {
+    await pool.query(
+      `INSERT INTO vaults (contract_id, name, underlying_asset, decimals)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (contract_id) DO UPDATE
+         SET name=$2, underlying_asset=$3, decimals=$4, updated_at=NOW()`,
+      [vault.contract_id, vault.name ?? null, vault.underlying_asset ?? null, vault.decimals ?? 7]
+    );
+  },
+
+  async unregisterVault(contractId) {
+    await pool.query("DELETE FROM vaults WHERE contract_id = $1", [contractId]);
+  },
+
+  async getVaults() {
+    const { rows } = await pool.query(
+      `SELECT v.*,
+        (SELECT ratio FROM vault_snapshots WHERE contract_id = v.contract_id ORDER BY ledger DESC LIMIT 1) AS latest_ratio,
+        (SELECT ledger FROM vault_snapshots WHERE contract_id = v.contract_id ORDER BY ledger DESC LIMIT 1) AS latest_ledger
+       FROM vaults v WHERE v.active = TRUE ORDER BY v.created_at DESC`
+    );
+    return rows;
+  },
+
+  async getVault(contractId) {
+    const { rows } = await pool.query(
+      `SELECT v.*,
+        (SELECT ratio FROM vault_snapshots WHERE contract_id = v.contract_id ORDER BY ledger DESC LIMIT 1) AS latest_ratio,
+        (SELECT ledger FROM vault_snapshots WHERE contract_id = v.contract_id ORDER BY ledger DESC LIMIT 1) AS latest_ledger
+       FROM vaults v WHERE v.contract_id = $1`,
+      [contractId]
+    );
+    return rows[0] ?? null;
+  },
+
+  async getActiveVaultIds() {
+    const { rows } = await pool.query("SELECT contract_id FROM vaults WHERE active = TRUE");
+    return rows.map(r => r.contract_id);
+  },
+
+  async upsertVaultSnapshot(snapshot) {
+    await pool.query(
+      `INSERT INTO vault_snapshots (contract_id, ledger, total_assets, total_supply, ratio)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [
+        snapshot.contract_id,
+        snapshot.ledger,
+        snapshot.total_assets,
+        snapshot.total_supply,
+        snapshot.ratio,
+      ]
+    );
+  },
+
+  async getVaultHistory(contractId, { limit = 100 } = {}) {
+    const { rows } = await pool.query(
+      `SELECT * FROM vault_snapshots
+       WHERE contract_id = $1
+       ORDER BY ledger DESC LIMIT $2`,
+      [contractId, limit]
+    );
+    return rows;
   },
 };

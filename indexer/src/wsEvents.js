@@ -19,6 +19,17 @@ export function publish(event) {
   bus.emit("event", event);
 }
 
+/** Publish a vault conversion-ratio update to all connected WebSocket clients. */
+export function publishVaultRatio(snapshot) {
+  bus.emit("vault_ratio", {
+    contract_id:  snapshot.contract_id,
+    ratio:        snapshot.ratio,
+    total_assets: snapshot.total_assets,
+    total_supply: snapshot.total_supply,
+    ledger:       snapshot.ledger,
+  });
+}
+
 /**
  * Attach a WebSocket server to an existing HTTP server instance.
  *
@@ -37,16 +48,26 @@ export function attachWebSocketServer(httpServer) {
       }
     };
 
+    // Forward vault ratio updates
+    const vaultHandler = (snapshot) => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ type: "vault_ratio", data: snapshot }));
+      }
+    };
+
     bus.on("event", handler);
+    bus.on("vault_ratio", vaultHandler);
 
     ws.on("close", () => {
       bus.off("event", handler);
+      bus.off("vault_ratio", vaultHandler);
       console.log("[ws] Client disconnected");
     });
 
     ws.on("error", (err) => {
       console.error("[ws] Socket error:", err.message);
       bus.off("event", handler);
+      bus.off("vault_ratio", vaultHandler);
     });
 
     // Acknowledge connection

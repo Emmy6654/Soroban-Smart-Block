@@ -90,14 +90,21 @@ export async function decode(ev) {
   const meta = await db.getContractMeta(contractId).catch(() => null);
   const fnAbi = meta?.functions?.find(f => f.name === fnName);
 
-  const { isSac, assetCode } = detectSac(contractId);
-  const contractLabel = isSac
-    ? `${assetCode} (SAC:${contractId.slice(0, 8)}…)`
-    : (meta?.name ?? contractId);
+  // Check if this contract is a registered vault
+  const vaultMeta = await db.getVault(contractId).catch(() => null);
 
-  const description = fnAbi
-    ? buildDescription(fnName, topics.slice(1), data, contractLabel)
-    : genericDescription(fnName, topics.slice(1), data, contractLabel);
+  const { isSac, assetCode } = detectSac(contractId);
+  const contractLabel = vaultMeta?.name
+    ? `${vaultMeta.name} (Vault)`
+    : isSac
+      ? `${assetCode} (SAC:${contractId.slice(0, 8)}…)`
+      : (meta?.name ?? contractId);
+
+  const description = vaultMeta
+    ? vaultDescription(fnName, topics.slice(1), data, contractLabel, vaultMeta)
+    : fnAbi
+      ? buildDescription(fnName, topics.slice(1), data, contractLabel)
+      : genericDescription(fnName, topics.slice(1), data, contractLabel);
 
   return {
     contract_id: contractId,
@@ -136,6 +143,28 @@ function nativeXlmDescription(fnName, args, data) {
     };
   }
   return null;
+}
+
+function vaultDescription(fn, args, data, contractName, vaultMeta) {
+  const assetLabel = vaultMeta.underlying_asset
+    ? `asset ${vaultMeta.underlying_asset.slice(0, 6)}…${vaultMeta.underlying_asset.slice(-4)}`
+    : "underlying asset";
+  switch (fn) {
+    case "mint":
+    case "deposit": {
+      const [admin, to, amount, shares] = args;
+      return `Deposited ${String(amount ?? data ?? "?")} ${assetLabel} → minted ${String(shares ?? "?")} shares to ${fmt(to ?? admin)} on ${contractName}`;
+    }
+    case "burn":
+    case "withdraw": {
+      const [admin, from, to, assets, shares] = args.length >= 4 ? args : [null, null, args[0], args[1], args[2]];
+      const amt = assets ?? data;
+      const shr = shares ?? "?";
+      return `Burned ${String(shr)} shares → withdrew ${String(amt)} ${assetLabel} from ${fmt(from ?? admin ?? to)} on ${contractName}`;
+    }
+    default:
+      return genericDescription(fn, args, data, contractName);
+  }
 }
 
 function buildDescription(fn, args, data, contractName) {

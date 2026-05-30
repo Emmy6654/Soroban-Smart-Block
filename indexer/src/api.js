@@ -3,9 +3,11 @@ import http from "http";
 import { db } from "./db.js";
 import { fetchTokenMetadata } from "./sep41Metadata.js";
 import { attachWebSocketServer } from "./wsEvents.js";
+import { bootstrapVault, refreshVaultRatio } from "./vaultIndexer.js";
 
 const PORT = process.env.PORT || 3001;
 const VERIFY_ON_UPLOAD = process.env.VERIFY_ABI !== "false";
+const RPC_URL = process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 
 export function startApi() {
   const app = express();
@@ -202,6 +204,77 @@ export function startApi() {
         limit:         limit         ? Math.min(Number(limit), 100) : 25,
       });
       res.json(result);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ── Vault indexer endpoints ─────────────────────────────────────────────────
+
+  // POST /api/vaults — register a vault to monitor
+  app.post("/api/vaults", async (req, res) => {
+    try {
+      const { contract_id, name, decimals } = req.body;
+      if (!contract_id) return res.status(400).json({ error: "Missing contract_id" });
+
+      await db.registerVault({ contract_id, name: name ?? null, decimals: decimals ?? 7 });
+
+      // Bootstrap: discover underlying asset, take initial snapshot
+      bootstrapVault(contract_id).catch(err =>
+        console.error(`[vault] Bootstrap error for ${contract_id}: ${err.message}`)
+      );
+
+      res.status(201).json({ ok: true, contract_id });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/vaults — list all monitored vaults
+  app.get("/api/vaults", async (req, res) => {
+    try {
+      const vaults = await db.getVaults();
+      res.json(vaults);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/vaults/:id — vault detail with latest conversion ratio
+  app.get("/api/vaults/:id", async (req, res) => {
+    try {
+      const vault = await db.getVault(req.params.id);
+      if (!vault) return res.status(404).json({ error: "Vault not found" });
+      res.json(vault);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/vaults/:id/history — historical ratio snapshots
+  app.get("/api/vaults/:id/history", async (req, res) => {
+    try {
+      const { limit } = req.query;
+      const history = await db.getVaultHistory(req.params.id, {
+        limit: limit ? Math.min(Number(limit), 1000) : 100,
+      });
+      res.json(history);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // POST /api/vaults/:id/refresh — trigger an immediate ratio refresh
+  app.post("/api/vaults/:id/refresh", async (req, res) => {
+    try {
+      const vault = await db.getVault(req.params.id);
+      if (!vault) return res.status(404).json({ error: "Vault not found" });
+
+      const { SorobanRpc } = await import("@stellar/stellar-sdk");
+      const server = new SorobanRpc.Server(RPC_URL, { allowHttp: true });
+      const ledger = (await server.getLatestLedger()).sequence;
+
+      await refreshVaultRatio(req.params.id, ledger);
+      const updated = await db.getVault(req.params.id);
+      res.json(updated);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // DELETE /api/vaults/:id — unregister a vault
+  app.delete("/api/vaults/:id", async (req, res) => {
+    try {
+      await db.unregisterVault(req.params.id);
+      res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
