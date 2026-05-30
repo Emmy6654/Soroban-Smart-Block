@@ -1,4 +1,5 @@
 import { SorobanRpc, xdr, StrKey } from "@stellar/stellar-sdk";
+import { withRetry } from "./rpcRetry.js";
 
 const RPC_URL = process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const rpc = new SorobanRpc.Server(RPC_URL, { allowHttp: true });
@@ -17,7 +18,7 @@ export async function fetchContractSpec(contractId) {
     );
     key.ext(xdr.LedgerKeyExtensionV0.withV0({}));
 
-    const res = await rpc.getLedgerEntry(key);
+    const res = await withRetry(() => rpc.getLedgerEntry(key));
     if (!res?.val) return null;
 
     const data = res.val;

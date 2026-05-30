@@ -1,10 +1,8 @@
 import express from "express";
+import http from "http";
 import { db } from "./db.js";
 import { fetchTokenMetadata } from "./sep41Metadata.js";
-import { SorobanRpc, TransactionBuilder } from "@stellar/stellar-sdk";
-
-const RPC_URL = process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
-const _rpc = new SorobanRpc.Server(RPC_URL, { allowHttp: true });
+import { attachWebSocketServer } from "./wsEvents.js";
 
 const PORT = process.env.PORT || 3001;
 const VERIFY_ON_UPLOAD = process.env.VERIFY_ABI !== "false";
@@ -13,52 +11,7 @@ export function startApi() {
   const app = express();
   app.use(express.json());
 
-  // GET /api/account/:address — fetch account for transaction building
-  app.get("/api/account/:address", async (req, res) => {
-    try {
-      const account = await _rpc.getAccount(req.params.address);
-      res.json({ id: account.accountId(), sequence: account.sequenceNumber() });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
-
-  // POST /api/submit — broadcast a signed transaction XDR
-  app.post("/api/submit", async (req, res) => {
-    try {
-      const { xdr: txXdr } = req.body;
-      if (!txXdr) return res.status(400).json({ error: "Missing xdr" });
-      const network = await _rpc.getNetwork();
-      const tx = TransactionBuilder.fromXDR(txXdr, network.passphrase);
-      const result = await _rpc.sendTransaction(tx);
-      res.json({ hash: result.hash, status: result.status });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
-
-  // GET /api/health
-  app.get("/api/health", async (_req, res) => {
-    try {
-      const [latestLedger, dbMaxLedger] = await Promise.all([
-        _rpc.getLatestLedger().then(r => r.sequence),
-        db.getMaxLedger(),
-      ]);
-      const lag = latestLedger - dbMaxLedger;
-      const syncPct = latestLedger > 0
-        ? Math.min(100, Math.round((dbMaxLedger / latestLedger) * 10000) / 100)
-        : 0;
-      const mem = process.memoryUsage();
-      res.json({
-        status: lag < 100 ? "ok" : "lagging",
-        sync_pct: syncPct,
-        lag_ledgers: lag,
-        network_ledger: latestLedger,
-        indexed_ledger: dbMaxLedger,
-        memory: {
-          rss_mb:       Math.round(mem.rss / 1024 / 1024 * 100) / 100,
-          heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024 * 100) / 100,
-          heap_total_mb:Math.round(mem.heapTotal / 1024 / 1024 * 100) / 100,
-        },
-      });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-  });
+  // ── Existing endpoints ──────────────────────────────────────────────────────
 
   // GET /api/events?contract=&fn=&page=
   app.get("/api/events", async (req, res) => {
@@ -67,6 +20,7 @@ export function startApi() {
         contract: req.query.contract,
         fn:       req.query.fn,
         page:     Number(req.query.page) || 1,
+        type:     req.query.type,
       });
       res.json(events);
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -88,6 +42,32 @@ export function startApi() {
       if (!meta) return res.status(404).json({ error: "Not found" });
       res.json(meta);
     } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // GET /api/contracts/:id/abi — download standardized ABI JSON
+  app.get("/api/contracts/:id/abi", async (req, res) => {
+    try {
+      const { fetchContractSpec } = await import("./verify_abi.js");
+      const meta = await db.getContractMeta(req.params.id);
+      const spec = await fetchContractSpec(req.params.id);
+      const abi = {
+        contractId: req.params.id,
+        name: meta?.name || "",
+        description: meta?.description || "",
+        functions: (spec || []).map(fn => {
+          const registered = meta?.functions?.find(f => f.name === fn.name);
+          return {
+            name: fn.name,
+            description: registered?.description || "",
+            args: fn.args.map(a => ({ name: a.name, type: a.type })),
+          };
+        }),
+      };
+      res.setHeader("Content-Disposition", `attachment; filename="${req.params.id}.abi.json"`);
+      res.json(abi);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
   });
 
   // POST /api/contracts  — register ABI metadata
@@ -148,6 +128,43 @@ export function startApi() {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // POST /api/simulate — issue #46: simulate a contract call via RPC
+  app.post("/api/simulate", async (req, res) => {
+    try {
+      const { contractId, fn, args = [] } = req.body;
+      if (!contractId || !fn) return res.status(400).json({ error: "Missing contractId or fn" });
+
+      const { SorobanRpc, Contract, nativeToScVal, xdr } = await import("@stellar/stellar-sdk");
+      const rpcUrl = process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
+      const server = new SorobanRpc.Server(rpcUrl);
+
+      const contract = new Contract(contractId);
+      const scArgs = args.map(a => nativeToScVal(a));
+      const op = contract.call(fn, ...scArgs);
+
+      const account = await server.getAccount(process.env.SIMULATE_SOURCE || "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN");
+      const { TransactionBuilder, Networks, BASE_FEE } = await import("@stellar/stellar-sdk");
+      const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: Networks.TESTNET })
+        .addOperation(op)
+        .setTimeout(30)
+        .build();
+
+      const sim = await server.simulateTransaction(tx);
+
+      if (SorobanRpc.Api.isSimulationError(sim)) {
+        return res.json({ success: false, error: sim.error });
+      }
+
+      const cost = sim.cost ?? {};
+      const retVal = sim.result?.retval;
+      res.json({
+        success: true,
+        returnValue: retVal ? retVal.toXDR("base64") : undefined,
+        cost: { cpuInsns: String(cost.cpuInsns ?? 0), memBytes: String(cost.memBytes ?? 0) },
+      });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+  });
+
   // GET /api/wallet/:address
   app.get("/api/wallet/:address", async (req, res) => {
     try {
@@ -172,5 +189,25 @@ export function startApi() {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
-  app.listen(PORT, () => console.log(`API listening on :${PORT}`));
+  // ── Issue #38: Contract transaction history ─────────────────────────────────
+  // GET /api/v1/contracts/:id/transactions?function_name=&start_ledger=&end_ledger=&page=&limit=
+  app.get("/api/v1/contracts/:id/transactions", async (req, res) => {
+    try {
+      const { function_name, start_ledger, end_ledger, page, limit } = req.query;
+      const result = await db.getContractTransactions(req.params.id, {
+        function_name: function_name || undefined,
+        start_ledger:  start_ledger  ? Number(start_ledger)  : undefined,
+        end_ledger:    end_ledger    ? Number(end_ledger)    : undefined,
+        page:          page          ? Number(page)          : 1,
+        limit:         limit         ? Math.min(Number(limit), 100) : 25,
+      });
+      res.json(result);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ── Start HTTP + WebSocket server ───────────────────────────────────────────
+  const server = http.createServer(app);
+  attachWebSocketServer(server);                // Issue #39
+  server.listen(PORT, () => console.log(`API listening on :${PORT}`));
+  return server;
 }

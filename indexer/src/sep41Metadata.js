@@ -13,6 +13,7 @@ import {
   scValToNative,
   nativeToScVal,
 } from "@stellar/stellar-sdk";
+import { withRetry } from "./rpcRetry.js";
 
 const RPC_URL          = process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE || Networks.TESTNET;
@@ -35,7 +36,7 @@ async function simulateCall(contractId, method) {
     .setTimeout(30)
     .build();
 
-  const result = await rpc.simulateTransaction(tx);
+  const result = await withRetry(() => rpc.simulateTransaction(tx));
   if (SorobanRpc.Api.isSimulationError(result)) {
     throw new Error(`simulate ${method} failed: ${result.error}`);
   }

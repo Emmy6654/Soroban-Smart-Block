@@ -1,4 +1,51 @@
 import { xdr, scValToNative, StrKey } from "@stellar/stellar-sdk";
+
+/**
+ * Issue #40 — Extract CPU instructions, memory bytes, and fee charged from
+ * the Soroban RPC event's transaction metadata.
+ *
+ * The Soroban RPC event object may carry a `feeBump` or `feeCharged` field
+ * directly, and the `txMeta` (TransactionMeta XDR) contains sorobanMeta with
+ * resource usage.  We extract what's available and return undefined for the
+ * rest so callers can store only what exists.
+ *
+ * @param {object} ev  Raw Soroban RPC event
+ * @returns {{ cpu_instructions?: number, mem_bytes?: number, fee_charged?: number }}
+ */
+function extractGasCosts(ev) {
+  const result = {};
+
+  try {
+    // fee_charged is sometimes surfaced directly on the event
+    if (ev.feeCharged != null) result.fee_charged = Number(ev.feeCharged);
+
+    const meta = ev.txMeta;
+    if (!meta) return result;
+
+    // TransactionMeta is an XDR union; v3 carries sorobanMeta
+    let sorobanMeta = null;
+    try {
+      sorobanMeta = meta.v3?.().sorobanMeta?.() ?? null;
+    } catch { /* not v3 */ }
+
+    if (!sorobanMeta) return result;
+
+    // SorobanTransactionMeta.ext carries resource fee breakdown in v1
+    try {
+      const extV1 = sorobanMeta.ext?.().v1?.();
+      if (extV1) {
+        if (extV1.totalNonRefundableResourceFeeCharged != null)
+          result.cpu_instructions = Number(extV1.totalNonRefundableResourceFeeCharged);
+        if (extV1.totalRefundableResourceFeeCharged != null)
+          result.fee_charged = Number(extV1.totalRefundableResourceFeeCharged);
+        if (extV1.rentFeeCharged != null)
+          result.mem_bytes = Number(extV1.rentFeeCharged);
+      }
+    } catch { /* ext not v1 */ }
+  } catch { /* ignore all extraction errors */ }
+
+  return result;
+}
 import { db } from "./db.js";
 import { sacLabel, detectSac } from "./sac.js";
 
@@ -34,6 +81,7 @@ export async function decode(ev) {
         description: wrapUnwrap.description,
         raw_topics:  topics.map(String),
         raw_data:    JSON.stringify(data),
+        ...extractGasCosts(ev),
       };
     }
   }
@@ -60,6 +108,8 @@ export async function decode(ev) {
     raw_topics:  topics.map(String),
     raw_data:    JSON.stringify(data),
     ...(isSac && { sac_asset: assetCode }),
+    ...extractGasCosts(ev),
+  };
   };
 }
 
