@@ -1,6 +1,8 @@
 import express from "express";
+import http from "http";
 import { db } from "./db.js";
 import { fetchTokenMetadata } from "./sep41Metadata.js";
+import { attachWebSocketServer } from "./wsEvents.js";
 
 const PORT = process.env.PORT || 3001;
 const VERIFY_ON_UPLOAD = process.env.VERIFY_ABI !== "false";
@@ -8,6 +10,8 @@ const VERIFY_ON_UPLOAD = process.env.VERIFY_ABI !== "false";
 export function startApi() {
   const app = express();
   app.use(express.json());
+
+  // ── Existing endpoints ──────────────────────────────────────────────────────
 
   // GET /api/events?contract=&fn=&page=
   app.get("/api/events", async (req, res) => {
@@ -121,5 +125,25 @@ export function startApi() {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
-  app.listen(PORT, () => console.log(`API listening on :${PORT}`));
+  // ── Issue #38: Contract transaction history ─────────────────────────────────
+  // GET /api/v1/contracts/:id/transactions?function_name=&start_ledger=&end_ledger=&page=&limit=
+  app.get("/api/v1/contracts/:id/transactions", async (req, res) => {
+    try {
+      const { function_name, start_ledger, end_ledger, page, limit } = req.query;
+      const result = await db.getContractTransactions(req.params.id, {
+        function_name: function_name || undefined,
+        start_ledger:  start_ledger  ? Number(start_ledger)  : undefined,
+        end_ledger:    end_ledger    ? Number(end_ledger)    : undefined,
+        page:          page          ? Number(page)          : 1,
+        limit:         limit         ? Math.min(Number(limit), 100) : 25,
+      });
+      res.json(result);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // ── Start HTTP + WebSocket server ───────────────────────────────────────────
+  const server = http.createServer(app);
+  attachWebSocketServer(server);                // Issue #39
+  server.listen(PORT, () => console.log(`API listening on :${PORT}`));
+  return server;
 }

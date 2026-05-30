@@ -1,6 +1,7 @@
 import { useParams, Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api";
+import ResourceCosts from "../components/ResourceCosts";
 
 export default function EventPage() {
   const { seq = "0" } = useParams();
@@ -27,6 +28,9 @@ export default function EventPage() {
           <Row label="Topics" value={ev.raw_topics.join(", ")} mono />
         )}
       </div>
+
+      {/* Issue #40 — Resource Consumption breakdown */}
+      <ResourceCosts event={ev} />
     </div>
   );
 }

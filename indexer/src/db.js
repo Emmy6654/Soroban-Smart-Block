@@ -6,15 +6,19 @@ export const db = {
   async init() {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS events (
-        seq         BIGSERIAL PRIMARY KEY,
-        contract_id TEXT NOT NULL,
-        function    TEXT NOT NULL,
-        ledger      BIGINT NOT NULL,
-        tx_hash     TEXT,
-        description TEXT NOT NULL,
-        raw_topics  JSONB,
-        raw_data    TEXT,
-        created_at  TIMESTAMPTZ DEFAULT NOW()
+        seq              BIGSERIAL PRIMARY KEY,
+        contract_id      TEXT NOT NULL,
+        function         TEXT NOT NULL,
+        ledger           BIGINT NOT NULL,
+        tx_hash          TEXT,
+        description      TEXT NOT NULL,
+        raw_topics       JSONB,
+        raw_data         TEXT,
+        -- Issue #40: Soroban resource gas costs
+        cpu_instructions BIGINT,
+        mem_bytes        BIGINT,
+        fee_charged      BIGINT,
+        created_at       TIMESTAMPTZ DEFAULT NOW()
       );
       CREATE INDEX IF NOT EXISTS idx_events_contract ON events(contract_id);
       CREATE INDEX IF NOT EXISTS idx_events_function ON events(function);
@@ -28,16 +32,28 @@ export const db = {
         registered_by TEXT,
         created_at  TIMESTAMPTZ DEFAULT NOW()
       );
+
+      -- Issue #37: ledger hash registry for re-org detection
+      CREATE TABLE IF NOT EXISTS ledger_hashes (
+        ledger     BIGINT PRIMARY KEY,
+        hash       TEXT   NOT NULL,
+        indexed_at TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
   },
 
   async upsertEvent(ev) {
     await pool.query(
-      `INSERT INTO events (contract_id, function, ledger, tx_hash, description, raw_topics, raw_data)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `INSERT INTO events
+         (contract_id, function, ledger, tx_hash, description, raw_topics, raw_data,
+          cpu_instructions, mem_bytes, fee_charged)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
        ON CONFLICT DO NOTHING`,
-      [ev.contract_id, ev.function, ev.ledger, ev.tx_hash,
-       ev.description, JSON.stringify(ev.raw_topics), ev.raw_data]
+      [
+        ev.contract_id, ev.function, ev.ledger, ev.tx_hash,
+        ev.description, JSON.stringify(ev.raw_topics), ev.raw_data,
+        ev.cpu_instructions ?? null, ev.mem_bytes ?? null, ev.fee_charged ?? null,
+      ]
     );
   },
 
@@ -73,6 +89,43 @@ export const db = {
   async getContractMeta(id) {
     const { rows } = await pool.query("SELECT * FROM contracts WHERE id = $1", [id]);
     return rows[0] ?? null;
+  },
+
+  /**
+   * Issue #38 — paginated contract transaction history with optional filters.
+   * @param {string} contractId
+   * @param {{ function_name?: string, start_ledger?: number, end_ledger?: number, page?: number, limit?: number }} opts
+   */
+  async getContractTransactions(contractId, { function_name, start_ledger, end_ledger, page = 1, limit = 25 } = {}) {
+    const params = [contractId];
+    const conditions = ["contract_id = $1"];
+
+    if (function_name) { params.push(function_name);  conditions.push(`function = $${params.length}`); }
+    if (start_ledger)  { params.push(start_ledger);   conditions.push(`ledger >= $${params.length}`); }
+    if (end_ledger)    { params.push(end_ledger);      conditions.push(`ledger <= $${params.length}`); }
+
+    const where  = conditions.join(" AND ");
+    const offset = (page - 1) * limit;
+
+    const [{ rows }, { rows: countRows }] = await Promise.all([
+      pool.query(
+        `SELECT * FROM events WHERE ${where} ORDER BY ledger DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        [...params, limit, offset]
+      ),
+      pool.query(`SELECT COUNT(*)::INT AS total FROM events WHERE ${where}`, params),
+    ]);
+
+    const total = countRows[0].total;
+    return {
+      data: rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        total_pages: Math.ceil(total / limit),
+        has_next: page * limit < total,
+      },
+    };
   },
 
   /**
